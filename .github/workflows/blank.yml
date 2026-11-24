@@ -1,0 +1,169 @@
+name: win 11 + tailscale + Steam + Download.bat script
+
+on:
+  workflow_dispatch:
+
+jobs:
+  secure-rdp:
+    runs-on: windows-2022
+    timeout-minutes: 350
+
+    steps:
+      - name: Configure Core RDP Settings
+        shell: pwsh
+        run: |
+          # Enable Remote Desktop and disable Network Level Authentication
+          Set-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server" `
+                           -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" `
+                           -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" `
+                           -Name "SecurityLayer" -Value 0 -Force
+
+          # Recreate RDP firewall rule cleanly on port 3389
+          netsh advfirewall firewall delete rule name="RDP-Tailscale" 2>$null | Out-Null
+          netsh advfirewall firewall add rule name="RDP-Tailscale" `
+            dir=in action=allow protocol=TCP localport=3389 | Out-Null
+
+          # Restart Remote Desktop service
+          Restart-Service -Name TermService -Force
+
+      - name: Create RDP User with Fixed Password
+        shell: pwsh
+        run: |
+          $username = "RDP"
+          $password = "MR.English2008"
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+
+          if (-not (Get-LocalUser -Name $username -ErrorAction SilentlyContinue)) {
+              New-LocalUser -Name $username -Password $securePass -AccountNeverExpires -PasswordNeverExpires | Out-Null
+          }
+
+          Add-LocalGroupMember -Group "Administrators" -Member $username -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $username -ErrorAction SilentlyContinue
+
+          if (-not (Get-LocalUser -Name $username -ErrorAction SilentlyContinue)) {
+              Write-Error "User creation failed for $username"
+              exit 1
+          }
+
+          "RDP_USER=$username" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "RDP_PASS=$password" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Install and Connect Tailscale
+        shell: pwsh
+        run: |
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          $installerPath = "$env:TEMP\tailscale.msi"
+
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath -UseBasicParsing
+          Start-Process -FilePath "msiexec.exe" -ArgumentList "/i `"$installerPath`" /quiet /norestart" -Wait
+          Remove-Item -Path $installerPath -Force -ErrorAction SilentlyContinue
+
+          $tsExe = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          if (-not (Test-Path $tsExe)) {
+              Write-Error "Tailscale executable not found after installation."
+              exit 1
+          }
+
+          & $tsExe up --authkey="${{ secrets.TAILSCALE_AUTHKEY }}" --hostname="gh-runner-$env:GITHUB_RUN_ID"
+
+          $tsIP = $null
+          for ($i = 0; $i -lt 15; $i++) {
+              $ipOut = & $tsExe ip -4 2>$null
+              if ($ipOut) {
+                  $tsIP = ($ipOut | Select-Object -First 1).Trim()
+                  if ($tsIP) { break }
+              }
+              Start-Sleep -Seconds 4
+          }
+
+          if (-not $tsIP) {
+              Write-Error "Tailscale IPv4 was not assigned in time."
+              exit 1
+          }
+
+          "TAILSCALE_IP=$tsIP" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          Write-Host "Tailscale IP assigned: $tsIP"
+
+      - name: Install Steam Silently
+        shell: pwsh
+        run: |
+          $steamUrl = "https://cdn.cloudflare.steamstatic.com/client/installer/SteamSetup.exe"
+          $steamInstaller = "$env:TEMP\SteamSetup.exe"
+
+          try {
+              Invoke-WebRequest -Uri $steamUrl -OutFile $steamInstaller -UseBasicParsing
+              Start-Process -FilePath $steamInstaller -ArgumentList "/S" -Wait
+              Remove-Item -Path $steamInstaller -Force -ErrorAction SilentlyContinue
+              Write-Host "Steam installed successfully."
+          }
+          catch {
+              Write-Warning "Steam installation encountered an issue: $($_.Exception.Message)"
+          }
+
+      - name: Verify RDP Port 3389
+        shell: pwsh
+        run: |
+          $ready = $false
+          for ($i = 0; $i -lt 10; $i++) {
+              $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389 -WarningAction SilentlyContinue
+              if ($testResult.TcpTestSucceeded) {
+                  $ready = $true
+                  break
+              }
+              Start-Sleep -Seconds 3
+          }
+
+          if (-not $ready) {
+              Write-Error "TCP connection to $env:TAILSCALE_IP on port 3389 failed."
+              exit 1
+          }
+
+          Write-Host "TCP connectivity on port 3389 is active and verified."
+
+      - name: Maintain Connection and Run Startup Script
+        shell: pwsh
+        run: |
+          Write-Host ""
+          Write-Host "=== RDP ACCESS ==="
+          Write-Host "Address : $env:TAILSCALE_IP"
+          Write-Host "Username: $env:RDP_USER"
+          Write-Host "Password: $env:RDP_PASS"
+          Write-Host "=================="
+          Write-Host ""
+
+          $rdpProfile = "C:\Users\RDP"
+          $startupPath = "$rdpProfile\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup"
+          $downloadUrl = "https://gitlab.com/MR.English2008/pcme_rdp/-/raw/main/Downloads.bat"
+          $downloadPath = "$startupPath\Downloads.bat"
+
+          $maxWaitLoops = 20
+          for ($i = 0; $i -lt $maxWaitLoops; $i++) {
+              if (Test-Path $rdpProfile) {
+                  try {
+                      if (-not (Test-Path $startupPath)) {
+                          New-Item -ItemType Directory -Path $startupPath -Force | Out-Null
+                      }
+
+                      Invoke-WebRequest -Uri $downloadUrl -OutFile $downloadPath -UseBasicParsing
+                      Write-Host "Downloads.bat copied to $downloadPath"
+
+                      cmd.exe /c "`"$downloadPath`""
+                      Write-Host "Downloads.bat executed successfully."
+                  }
+                  catch {
+                      Write-Warning "Error copying or executing Downloads.bat: $($_.Exception.Message)"
+                  }
+                  break
+              }
+              else {
+                  Write-Host "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Waiting for RDP profile directory..."
+                  Start-Sleep -Seconds 15
+              }
+          }
+
+          while ($true) {
+              Write-Host "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] RDP Active - IP: $env:TAILSCALE_IP"
+              Start-Sleep -Seconds 600
+          }
